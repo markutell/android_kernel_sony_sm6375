@@ -1,4 +1,4 @@
-name: KernelSU Next Config Audit
+name: PDX225 KernelSU Next Boot Image
 
 on:
   workflow_dispatch:
@@ -10,99 +10,153 @@ permissions:
   contents: read
 
 jobs:
-  audit:
+  build:
     runs-on: ubuntu-22.04
-
     steps:
       - name: Checkout kernel
         uses: actions/checkout@v4
+        with:
+          path: kernel/sony/sm6375
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison build-essential curl flex git \
-            libelf-dev libssl-dev lz4 python3 \
-            rsync unzip zip
+            git curl wget jq unzip python3 \
+            bc bison flex build-essential \
+            libssl-dev libelf-dev \
+            libncurses-dev dwarves lz4 cpio \
+            rsync zip
 
-      - name: Download Clang r416183b
+      - name: Download Clang
         run: |
-          set -euxo pipefail
+          git clone --depth=1 --branch ruby \
+            https://github.com/AOSPA/android_prebuilts_clang_host_linux-x86.git clang-src
+          test -x clang-src/clang-r416183b/bin/clang
+          echo "$GITHUB_WORKSPACE/clang-src/clang-r416183b/bin" >> "$GITHUB_PATH"
 
-          TOOLCHAIN="$GITHUB_WORKSPACE/prebuilts-master/clang/host/linux-x86"
-
-          git clone --depth=1 --filter=blob:none --sparse \
-            --branch ruby \
-            https://github.com/AOSPA/android_prebuilts_clang_host_linux-x86.git \
-            "$TOOLCHAIN"
-
-          git -C "$TOOLCHAIN" sparse-checkout set clang-r416183b
-
-          echo "$TOOLCHAIN/clang-r416183b/bin" >> "$GITHUB_PATH"
-
-      - name: Verify compiler
+      - name: Setup KernelSU Next
+        working-directory: kernel/sony/sm6375
         run: |
-          clang --version
-          ld.lld --version
-
-      - name: Integrate KernelSU Next
-        run: |
-          set -euxo pipefail
-
-          curl -LSs \
-            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
-            | bash -s legacy
-
+          curl -LSs https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh | bash -s legacy
           test -d KernelSU-Next
 
-      - name: Generate and audit configuration
+      - name: Download official PDX225 boot image
         run: |
           set -euxo pipefail
 
-          make ARCH=arm64 LLVM=1 O=out \
-            vendor/holi-qgki_defconfig
+          curl -fL \
+            https://download.lineageos.org/api/v2/devices/pdx225/builds \
+            -o builds.json
 
-          scripts/kconfig/merge_config.sh -O out \
-            out/.config \
-            arch/arm64/configs/diffconfig/common.config \
-            arch/arm64/configs/diffconfig/pdx225.config
+          jq 'type, (if type == "array" then .[0] else keys end)' builds.json
 
+          OTA_URL=$(jq -r '
+            if type == "array" then
+              [.[0].files[]? | select(.filename | endswith(".zip"))][0].url
+            else
+              empty
+            end
+          ' builds.json)
+
+          test -n "$OTA_URL"
+          test "$OTA_URL" != "null"
+
+          curl -fL "$OTA_URL" -o lineage.zip
+
+          unzip -p lineage.zip payload.bin > payload.bin
+          test -s payload.bin
+
+      - name: Get magiskboot
+        run: |
+          set -euxo pipefail
+          MAGISK_URL=$(curl -fsSL https://api.github.com/repos/topjohnwu/Magisk/releases/latest |
+            jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' |
+            head -n1)
+          test -n "$MAGISK_URL"
+          curl -fL "$MAGISK_URL" -o magisk.apk
+          unzip -p magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
+          chmod +x magiskboot
+          ./magiskboot --help || true
+
+      - name: Extract original boot image
+        run: |
+          set -euxo pipefail
+          ./magiskboot extract payload.bin boot boot.img
+          test -s boot.img
+
+      - name: Configure kernel
+        working-directory: kernel/sony/sm6375
+        run: |
+          set -euxo pipefail
+
+          export ARCH=arm64
+          export LLVM=1
+          export PATH="$GITHUB_WORKSPACE/clang-src/clang-r416183b/bin:$PATH"
+
+          make O=out vendor/holi-qgki_defconfig
           scripts/config --file out/.config \
             --enable MODULES \
             --enable KPROBES \
             --enable KPROBE_EVENTS \
             --enable KSU \
-            --enable KSU_KPROBE_HOOKS
+            --enable LEDS_CLASS \
+            --enable LEDS_QPNP_VIBRATOR_LDO
 
-          make ARCH=arm64 LLVM=1 O=out olddefconfig
+          make O=out olddefconfig
 
-          {
-            echo "===== COMPILER ====="
-            clang --version
-
-            echo "===== KERNEL VERSION ====="
-            make ARCH=arm64 LLVM=1 O=out kernelversion
-
-            echo "===== FINAL CONFIG ====="
-            grep -E '^(CONFIG_MODULES|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_KSU|CONFIG_KSU_KPROBE_HOOKS)=' out/.config || true
-
-            echo "===== DISABLED CONFIG ====="
-            grep -E '^# CONFIG_(MODULES|KPROBES|KPROBE_EVENTS|KSU|KSU_KPROBE_HOOKS) is not set' out/.config || true
-          } 2>&1 | tee build-audit.log
-
-          for option in MODULES KPROBES KPROBE_EVENTS KSU; do
+          for option in MODULES KPROBES KPROBE_EVENTS KSU LEDS_CLASS LEDS_QPNP_VIBRATOR_LDO; do
             grep -qx "CONFIG_${option}=y" out/.config || {
               echo "ERROR: CONFIG_${option} is not enabled"
               exit 1
             }
           done
 
-      - name: Upload audit results
-        if: always()
+      - name: Build kernel
+        working-directory: kernel/sony/sm6375
+        run: |
+          set -euxo pipefail
+          export ARCH=arm64
+          export LLVM=1
+          export PATH="$GITHUB_WORKSPACE/clang-src/clang-r416183b/bin:$PATH"
+
+          make -j"$(nproc)" O=out \
+            Image dtbs
+
+          test -s out/arch/arm64/boot/Image
+          cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/Image"
+
+      - name: Repack boot image
+        run: |
+          set -euxo pipefail
+
+          mkdir boot-work
+          cd boot-work
+
+          cp ../boot.img .
+          cp ../Image .
+
+          ../magiskboot unpack boot.img
+
+          test -s kernel
+          cp Image kernel
+
+          ../magiskboot repack boot.img new-boot.img
+
+          test -s new-boot.img
+          ../magiskboot unpack new-boot.img
+
+          test -s kernel
+          echo "Custom boot image generated successfully."
+
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp new-boot.img "$GITHUB_WORKSPACE/output/boot.img"
+          cp ../Image "$GITHUB_WORKSPACE/output/Image"
+          cp ../boot.img "$GITHUB_WORKSPACE/output/boot-original.img"
+
+      - name: Upload flashable boot image
         uses: actions/upload-artifact@v4
         with:
-          name: ksunext-config-audit
-          path: |
-            out/.config
-            build-audit.log
-          if-no-files-found: warn
+          name: PDX225-KernelSU-Next-boot
+          path: output/
+          if-no-files-found: error
