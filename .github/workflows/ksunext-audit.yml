@@ -79,10 +79,12 @@ jobs:
           chmod +x magiskboot
           ./magiskboot --help || true
 
-      - name: Extract original boot image
+      - name: Extract original boot and vendor_boot images
         run: |
           set -euxo pipefail
           ./magiskboot extract payload.bin boot boot.img
+          ./magiskboot extract payload.bin vendor_boot vendor_boot.img
+          test -s vendor_boot.img
           test -s boot.img
 
       - name: Configure kernel
@@ -104,9 +106,8 @@ jobs:
             --enable KPROBE_EVENTS \
             --enable KSU \
             --enable LEDS_CLASS \
-            --enable LEDS_QPNP_VIBRATOR_LDO
           make O=out olddefconfig
-          for option in MODULES KPROBES KPROBE_EVENTS KSU LEDS_CLASS LEDS_QPNP_VIBRATOR_LDO ARCH_SONY_MURRAY; do
+          for option in MODULES KPROBES KPROBE_EVENTS KSU LEDS_CLASS ARCH_SONY_MURRAY; do
             grep -qx "CONFIG_${option}=y" out/.config || exit 1
           done
 
@@ -151,6 +152,21 @@ jobs:
           cp new-boot.img "$GITHUB_WORKSPACE/output/boot.img"
           cp ../Image "$GITHUB_WORKSPACE/output/Image"
           cp ../boot.img "$GITHUB_WORKSPACE/output/boot-original.img"
+
+      - name: Repack vendor_boot image
+        run: |
+          set -euxo pipefail
+          mkdir vb-work
+          cd vb-work
+          cp ../vendor_boot.img .
+          cp ../Image .
+          ../magiskboot unpack vendor_boot.img
+          if [ -f kernel ]; then cp Image kernel; fi
+          ../magiskboot repack vendor_boot.img new-vendor_boot.img
+          test -s new-vendor_boot.img
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp new-vendor_boot.img "$GITHUB_WORKSPACE/output/vendor_boot.img"
+          cp ../vendor_boot.img "$GITHUB_WORKSPACE/output/vendor_boot-original.img"
 
       - name: Upload flashable boot image
         uses: actions/upload-artifact@v4
