@@ -105,7 +105,7 @@ jobs:
             --enable KPROBES \
             --enable KPROBE_EVENTS \
             --enable KSU \
-            --enable LEDS_CLASS \
+            --enable LEDS_CLASS
           make O=out olddefconfig
           for option in MODULES KPROBES KPROBE_EVENTS KSU LEDS_CLASS ARCH_SONY_MURRAY; do
             grep -qx "CONFIG_${option}=y" out/.config || exit 1
