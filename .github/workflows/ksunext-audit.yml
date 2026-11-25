@@ -1,0 +1,108 @@
+name: KernelSU Next Config Audit
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - lineage-24.0
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential curl flex git \
+            libelf-dev libssl-dev lz4 python3 \
+            rsync unzip zip
+
+      - name: Download Clang r416183b
+        run: |
+          set -euxo pipefail
+
+          TOOLCHAIN="$GITHUB_WORKSPACE/prebuilts-master/clang/host/linux-x86"
+
+          git clone --depth=1 --filter=blob:none --sparse \
+            --branch ruby \
+            https://github.com/AOSPA/android_prebuilts_clang_host_linux-x86.git \
+            "$TOOLCHAIN"
+
+          git -C "$TOOLCHAIN" sparse-checkout set clang-r416183b
+
+          echo "$TOOLCHAIN/clang-r416183b/bin" >> "$GITHUB_PATH"
+
+      - name: Verify compiler
+        run: |
+          clang --version
+          ld.lld --version
+
+      - name: Integrate KernelSU Next
+        run: |
+          set -euxo pipefail
+
+          curl -LSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s legacy
+
+          test -d KernelSU
+
+      - name: Generate and audit configuration
+        run: |
+          set -euxo pipefail
+
+          make ARCH=arm64 LLVM=1 O=out \
+            vendor/holi-qgki_defconfig
+
+          scripts/kconfig/merge_config.sh -O out \
+            out/.config \
+            arch/arm64/configs/diffconfig/common.config \
+            arch/arm64/configs/diffconfig/pdx225.config
+
+          scripts/config --file out/.config \
+            --enable MODULES \
+            --enable KPROBES \
+            --enable KPROBE_EVENTS \
+            --enable KSU \
+            --enable KSU_KPROBE_HOOKS
+
+          make ARCH=arm64 LLVM=1 O=out olddefconfig
+
+          {
+            echo "===== COMPILER ====="
+            clang --version
+
+            echo "===== KERNEL VERSION ====="
+            make ARCH=arm64 LLVM=1 O=out kernelversion
+
+            echo "===== FINAL CONFIG ====="
+            grep -E '^(CONFIG_MODULES|CONFIG_KPROBES|CONFIG_KPROBE_EVENTS|CONFIG_KSU|CONFIG_KSU_KPROBE_HOOKS)=' out/.config || true
+
+            echo "===== DISABLED CONFIG ====="
+            grep -E '^# CONFIG_(MODULES|KPROBES|KPROBE_EVENTS|KSU|KSU_KPROBE_HOOKS) is not set' out/.config || true
+          } 2>&1 | tee build-audit.log
+
+          for option in MODULES KPROBES KPROBE_EVENTS KSU KSU_KPROBE_HOOKS; do
+            grep -qx "CONFIG_${option}=y" out/.config || {
+              echo "ERROR: CONFIG_${option} is not enabled"
+              exit 1
+            }
+          done
+
+      - name: Upload audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksunext-config-audit
+          path: |
+            out/.config
+            build-audit.log
+          if-no-files-found: warn
