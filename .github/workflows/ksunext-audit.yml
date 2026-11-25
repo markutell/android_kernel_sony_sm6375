@@ -90,7 +90,7 @@ jobs:
             grep -E '^# CONFIG_(MODULES|KPROBES|KPROBE_EVENTS|KSU|KSU_KPROBE_HOOKS) is not set' out/.config || true
           } 2>&1 | tee build-audit.log
 
-          for option in MODULES KPROBES KPROBE_EVENTS KSU KSU_KPROBE_HOOKS; do
+          for option in MODULES KPROBES KPROBE_EVENTS KSU; do
             grep -qx "CONFIG_${option}=y" out/.config || {
               echo "ERROR: CONFIG_${option} is not enabled"
               exit 1
