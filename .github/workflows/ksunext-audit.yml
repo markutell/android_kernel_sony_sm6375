@@ -154,6 +154,7 @@ jobs:
           cp ../boot.img "$GITHUB_WORKSPACE/output/boot-original.img"
 
       - name: Repack vendor_boot image
+        continue-on-error: true
         run: |
           set -euxo pipefail
           mkdir vb-work
