@@ -139,25 +139,6 @@ jobs:
             fi
           fi
 
-      # Hook manual harus sudah ada di source (jalankan scripts/ksu_manual_hooks.py sekali, lalu commit).
-      - name: Cek hook manual KSU ada di source
-        if: ${{ inputs.with_ksu }}
-        working-directory: kernel/sony/sm6375
-        run: |
-          missing=0
-          check() {
-            if ! grep -q "$2" "$1"; then
-              echo "::error::Hook '$2' belum ada di $1 (jalankan scripts/ksu_manual_hooks.py)"
-              missing=1
-            fi
-          }
-          check fs/exec.c ksu_handle_execveat
-          check fs/open.c ksu_handle_faccessat
-          check fs/stat.c ksu_handle_stat
-          check kernel/reboot.c ksu_handle_sys_reboot
-          test -f include/linux/ksu_manual_hooks.h || { echo "::error::include/linux/ksu_manual_hooks.h tidak ada"; missing=1; }
-          [ "$missing" -eq 0 ] || exit 1
-
       - name: Download official PDX225 boot image
         run: |
           set -euxo pipefail
@@ -219,19 +200,16 @@ jobs:
             out/.config \
             arch/arm64/configs/diffconfig/common.config \
             arch/arm64/configs/diffconfig/pdx225.config
-          # KPROBES/KPROBE_EVENTS tidak lagi dipaksa: SUSFS di kernel non-GKI
-          # memakai hook manual, bukan kprobes.
+          # KPROBES/KPROBE_EVENTS tidak dipaksa (defconfig sudah punya KPROBES sendiri).
           scripts/config --file out/.config \
             --enable MODULES \
             --enable LEDS_CLASS
+          # Di Kconfig ReSukiSU/BakaSU, KSU_MANUAL_HOOK dan KSU_SUSFS ("SUSFS Inline Hook")
+          # adalah pilihan satu choice: tidak bisa aktif bersamaan. Hook datang dari patch SUSFS.
           if [ "$WITH_KSU" = "true" ]; then
             scripts/config --file out/.config \
               --enable KSU \
               --enable KSU_SUSFS \
-              --enable KSU_MANUAL_HOOK \
-              --enable KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
-              --enable KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
-              --enable KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
               --enable KALLSYMS \
               --enable KALLSYMS_ALL
           fi
@@ -239,7 +217,7 @@ jobs:
 
           opts="MODULES LEDS_CLASS ARCH_SONY_MURRAY"
           if [ "$WITH_KSU" = "true" ]; then
-            opts="$opts KSU KSU_SUSFS KSU_MANUAL_HOOK KALLSYMS KALLSYMS_ALL"
+            opts="$opts KSU KSU_SUSFS KALLSYMS KALLSYMS_ALL"
           fi
           fail=0
           for option in $opts; do
