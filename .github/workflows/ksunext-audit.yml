@@ -39,6 +39,11 @@ jobs:
         working-directory: kernel/sony/sm6375
         run: |
           curl -LSs https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh | bash -s legacy
+          # Paksa narik commit terbaru dari branch legacy
+          cd KernelSU-Next
+          git fetch origin legacy
+          git reset --hard origin/legacy
+          cd ..
           test -d KernelSU-Next
 
       - name: Download official PDX225 boot image
