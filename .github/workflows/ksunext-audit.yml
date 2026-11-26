@@ -35,16 +35,14 @@ jobs:
           test -x clang-src/clang-r416183b/bin/clang
           echo "$GITHUB_WORKSPACE/clang-src/clang-r416183b/bin" >> "$GITHUB_PATH"
 
-      - name: Setup KernelSU Next
+      - name: Setup SukiSU Nova builtin
         working-directory: kernel/sony/sm6375
         run: |
-          curl -LSs https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh | bash -s legacy
-          # Paksa narik commit terbaru dari branch legacy
-          cd KernelSU-Next
-          git fetch origin legacy
-          git reset --hard origin/legacy
-          cd ..
-          test -d KernelSU-Next
+          set -euxo pipefail
+          curl -fLSs "https://git.zako.shirkneko.top:20004/shirkneko/SukiSU/raw/branch/main/kernel/setup.sh" -o /tmp/sukisu-setup.sh
+          bash /tmp/sukisu-setup.sh builtin
+          test -L drivers/kernelsu
+          test -f drivers/kernelsu/Kconfig
 
       - name: Download official PDX225 boot image
         run: |
@@ -110,9 +108,10 @@ jobs:
             --enable KPROBES \
             --enable KPROBE_EVENTS \
             --enable KSU \
+            --enable KSU_HACK_ARM64_BRANCH_LINK \
             --enable LEDS_CLASS
           make O=out olddefconfig
-          for option in MODULES KPROBES KPROBE_EVENTS KSU LEDS_CLASS ARCH_SONY_MURRAY; do
+          for option in MODULES KPROBES KPROBE_EVENTS KSU KSU_HACK_ARM64_BRANCH_LINK LEDS_CLASS ARCH_SONY_MURRAY; do
             grep -qx "CONFIG_${option}=y" out/.config || exit 1
           done
 
