@@ -1,0 +1,288 @@
+name: PDX225 Kernel Boot Image (SukiSU Ultra + SUSFS)
+
+# Hanya manual (tidak lagi otomatis tiap push).
+on:
+  workflow_dispatch:
+    inputs:
+      with_ksu:
+        description: "SukiSU Ultra + SUSFS. false = baseline tanpa root (jalankan false DULU buat diagnosis)"
+        type: boolean
+        default: false
+      susfs_branch:
+        description: "Branch susfs4ksu untuk kernel 5.4 non-GKI (dicek otomatis)"
+        type: string
+        default: "kernel-5.4"
+      ksu_fork:
+        description: "Fork KernelSU (allowlist): ReSukiSU/ReSukiSU atau SukiSU-Ultra/SukiSU-Ultra"
+        type: string
+        default: "ReSukiSU/ReSukiSU"
+      ksu_setup_arg:
+        description: "Argumen setup.sh (kosong untuk ReSukiSU, 'builtin' untuk SukiSU-Ultra)"
+        type: string
+        default: ""
+      ksu_commit:
+        description: "Pin commit fork KSU (kosong = ujung branch default)"
+        type: string
+        default: ""
+      magisk_tag:
+        description: "Tag rilis Magisk untuk magiskboot (kosong = latest; disarankan di-pin)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pdx225-boot-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+        with:
+          path: kernel/sony/sm6375
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl wget jq unzip python3 \
+            bc bison flex build-essential \
+            libssl-dev libelf-dev \
+            libncurses-dev dwarves lz4 cpio \
+            rsync zip
+
+      # Clang sama seperti workflow lama (repo org AOSPA). Path r416183b dicek eksplisit.
+      - name: Download Clang
+        run: |
+          git clone --depth=1 --branch ruby \
+            https://github.com/AOSPA/android_prebuilts_clang_host_linux-x86.git clang-src
+          test -x clang-src/clang-r416183b/bin/clang
+          echo "$GITHUB_WORKSPACE/clang-src/clang-r416183b/bin" >> "$GITHUB_PATH"
+
+      # ---------------- Fork KernelSU: hanya dari GitHub, dengan allowlist ----------------
+      - name: Integrasi KernelSU fork (built-in)
+        if: ${{ inputs.with_ksu }}
+        working-directory: kernel/sony/sm6375
+        env:
+          KSU_FORK: ${{ inputs.ksu_fork }}
+          KSU_SETUP_ARG: ${{ inputs.ksu_setup_arg }}
+          KSU_COMMIT: ${{ inputs.ksu_commit }}
+        run: |
+          set -euxo pipefail
+          case "$KSU_FORK" in
+            ReSukiSU/ReSukiSU|SukiSU-Ultra/SukiSU-Ultra) ;;
+            *) echo "::error::Fork tidak ada di allowlist: $KSU_FORK"; exit 1 ;;
+          esac
+          curl -fLSs "https://raw.githubusercontent.com/${KSU_FORK}/main/kernel/setup.sh" -o /tmp/ksu-setup.sh
+          if [ -n "$KSU_SETUP_ARG" ]; then
+            bash /tmp/ksu-setup.sh "$KSU_SETUP_ARG"
+          else
+            bash /tmp/ksu-setup.sh
+          fi
+          test -L drivers/kernelsu
+          test -f drivers/kernelsu/Kconfig
+          KSU_DIR="$(dirname "$(readlink -f drivers/kernelsu)")"
+          if [ -n "$KSU_COMMIT" ]; then
+            git -C "$KSU_DIR" fetch --unshallow 2>/dev/null || true
+            git -C "$KSU_DIR" checkout "$KSU_COMMIT"
+          fi
+          echo "KSU_SHA=$(git -C "$KSU_DIR" rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "KSU: $KSU_FORK @ $(git -C "$KSU_DIR" rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------- SUSFS: gagal keras kalau ada hunk ditolak ----------------
+      - name: Patch SUSFS
+        if: ${{ inputs.with_ksu }}
+        working-directory: kernel/sony/sm6375
+        env:
+          SUSFS_BRANCH: ${{ inputs.susfs_branch }}
+        run: |
+          set -euo pipefail
+          REPO="https://gitlab.com/simonpunk/susfs4ksu.git"
+          if ! git ls-remote --exit-code --heads "$REPO" "$SUSFS_BRANCH" >/dev/null; then
+            echo "::error::Branch '$SUSFS_BRANCH' tidak ada. Branch yang tersedia:"
+            git ls-remote --heads "$REPO" | sed 's#.*refs/heads/##'
+            exit 1
+          fi
+          git clone --depth=1 -b "$SUSFS_BRANCH" "$REPO" /tmp/susfs
+          echo "SUSFS_SHA=$(git -C /tmp/susfs rev-parse HEAD)" >> "$GITHUB_ENV"
+
+          # Sisi KernelSU: hanya dipasang kalau cocok (SukiSU bisa saja sudah built-in).
+          KSU_DIR="$(dirname "$(readlink -f drivers/kernelsu)")"
+          KP=/tmp/susfs/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch
+          if [ -f "$KP" ]; then
+            if (cd "$KSU_DIR" && patch -p1 --dry-run < "$KP" >/dev/null 2>&1); then
+              (cd "$KSU_DIR" && patch -p1 < "$KP")
+            else
+              echo "::notice::10_enable_susfs_for_ksu.patch tidak cocok dengan SukiSU ini (kemungkinan sudah built-in), dilewati. Audit CONFIG_KSU_SUSFS di step konfigurasi yang memastikan."
+            fi
+          fi
+
+          # Sisi kernel
+          cp -v /tmp/susfs/kernel_patches/fs/* fs/
+          cp -v /tmp/susfs/kernel_patches/include/linux/* include/linux/
+          shopt -s nullglob
+          patches=(/tmp/susfs/kernel_patches/50_add_susfs_in_*.patch)
+          if [ "${#patches[@]}" -ne 1 ]; then
+            echo "::error::Harus tepat 1 file 50_add_susfs_in_*.patch, ketemu ${#patches[@]}"
+            ls -la /tmp/susfs/kernel_patches
+            exit 1
+          fi
+          if ! patch -p1 --no-backup-if-mismatch < "${patches[0]}"; then
+            echo "::error::Patch SUSFS ditolak sebagian. File .rej:"
+            find . -name '*.rej' -not -path './out/*'
+            exit 1
+          fi
+
+      # Hook manual harus sudah ada di source (jalankan scripts/ksu_manual_hooks.py sekali, lalu commit).
+      - name: Cek hook manual KSU ada di source
+        if: ${{ inputs.with_ksu }}
+        working-directory: kernel/sony/sm6375
+        run: |
+          missing=0
+          check() {
+            if ! grep -q "$2" "$1"; then
+              echo "::error::Hook '$2' belum ada di $1 (jalankan scripts/ksu_manual_hooks.py)"
+              missing=1
+            fi
+          }
+          check fs/exec.c ksu_handle_execveat
+          check fs/open.c ksu_handle_faccessat
+          check fs/stat.c ksu_handle_stat
+          check kernel/reboot.c ksu_handle_sys_reboot
+          test -f include/linux/ksu_manual_hooks.h || { echo "::error::include/linux/ksu_manual_hooks.h tidak ada"; missing=1; }
+          [ "$missing" -eq 0 ] || exit 1
+
+      - name: Download official PDX225 boot image
+        run: |
+          set -euxo pipefail
+          curl -fL https://download.lineageos.org/api/v2/devices/pdx225/builds -o builds.json
+          jq 'type, (if type == "array" then .[0] else keys end)' builds.json
+          OTA_URL=$(jq -r '
+            if type == "array" then
+              [.[0].files[]? | select(.filename | endswith(".zip"))][0].url
+            else
+              empty
+            end
+          ' builds.json)
+          test -n "$OTA_URL"
+          test "$OTA_URL" != "null"
+          curl -fL "$OTA_URL" -o lineage.zip
+          unzip -p lineage.zip payload.bin > payload.bin
+          test -s payload.bin
+
+      - name: Get magiskboot
+        env:
+          MAGISK_TAG: ${{ inputs.magisk_tag }}
+        run: |
+          set -euxo pipefail
+          if [ -n "$MAGISK_TAG" ]; then
+            API="https://api.github.com/repos/topjohnwu/Magisk/releases/tags/$MAGISK_TAG"
+          else
+            API="https://api.github.com/repos/topjohnwu/Magisk/releases/latest"
+          fi
+          MAGISK_URL=$(curl -fsSL "$API" |
+            jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' |
+            head -n1)
+          test -n "$MAGISK_URL"
+          echo "Magisk: $MAGISK_URL"
+          curl -fL "$MAGISK_URL" -o magisk.apk
+          unzip -p magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
+          chmod +x magiskboot
+          ./magiskboot --help || true
+
+      - name: Extract original boot and vendor_boot images
+        run: |
+          set -euxo pipefail
+          ./magiskboot extract payload.bin boot boot.img
+          ./magiskboot extract payload.bin vendor_boot vendor_boot.img
+          test -s vendor_boot.img
+          test -s boot.img
+
+      - name: Configure kernel
+        working-directory: kernel/sony/sm6375
+        shell: bash
+        env:
+          WITH_KSU: ${{ inputs.with_ksu }}
+        run: |
+          set -euxo pipefail
+          export ARCH=arm64
+          export LLVM=1
+          export PATH="$GITHUB_WORKSPACE/clang-src/clang-r416183b/bin:$PATH"
+          make O=out vendor/holi-qgki_defconfig
+          scripts/kconfig/merge_config.sh -m -O out \
+            out/.config \
+            arch/arm64/configs/diffconfig/common.config \
+            arch/arm64/configs/diffconfig/pdx225.config
+          # KPROBES/KPROBE_EVENTS tidak lagi dipaksa: SUSFS di kernel non-GKI
+          # memakai hook manual, bukan kprobes.
+          scripts/config --file out/.config \
+            --enable MODULES \
+            --enable LEDS_CLASS
+          if [ "$WITH_KSU" = "true" ]; then
+            scripts/config --file out/.config \
+              --enable KSU \
+              --enable KSU_SUSFS \
+              --enable KSU_MANUAL_HOOK \
+              --enable KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
+              --enable KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+              --enable KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
+              --enable KALLSYMS \
+              --enable KALLSYMS_ALL
+          fi
+          make O=out olddefconfig
+
+          opts="MODULES LEDS_CLASS ARCH_SONY_MURRAY"
+          if [ "$WITH_KSU" = "true" ]; then
+            opts="$opts KSU KSU_SUSFS KSU_MANUAL_HOOK KALLSYMS KALLSYMS_ALL"
+          fi
+          fail=0
+          for option in $opts; do
+            if ! grep -qx "CONFIG_${option}=y" out/.config; then
+              echo "::error::CONFIG_${option} tidak aktif di .config akhir"
+              fail=1
+            fi
+          done
+          grep -E "^CONFIG_(KSU|KPROBES|MODVERSIONS|MODULE_SIG|LOCALVERSION)" out/.config || true
+          [ "$fail" -eq 0 ] || exit 1
+
+      - name: Build kernel
+        working-directory: kernel/sony/sm6375
+        run: |
+          set -euxo pipefail
+          export ARCH=arm64
+          export LLVM=1
+          export PATH="$GITHUB_WORKSPACE/clang-src/clang-r416183b/bin:$PATH"
+          make -j"$(nproc)" O=out Image dtbs
+          test -s out/arch/arm64/boot/Image
+          cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/Image"
+
+      - name: Repack boot image
+        run: |
+          set -euxo pipefail
+          mkdir boot-work
+          cd boot-work
+          cp ../boot.img .
+          cp ../Image .
+          ../magiskboot unpack boot.img
+          test -s kernel
+          cp Image kernel
+          ../magiskboot repack boot.img new-boot.img
+          test -s new-boot.img
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp new-boot.img "$GITHUB_WORKSPACE/output/boot.img"
+          cp ../Image "$GITHUB_WORKSPACE/output/Image"
+          cp ../boot.img "$GITHUB_WORKSPACE/output/boot-original.img"
+          cp "$GITHUB_WORKSPACE/kernel/sony/sm6375/out/.config" "$GITHUB_WORKSPACE/output/kernel.config"
+
+      - name: Upload flashable boot image
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDX225-boot-${{ inputs.with_ksu && 'sukisu-susfs' || 'baseline' }}
+          path: output/
+          if-no-files-found: error
