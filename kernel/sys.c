@@ -5,6 +5,7 @@
  *  Copyright (C) 1991, 1992  Linus Torvalds
  */
 
+#include <linux/ksu_manual_hooks.h>
 #include <linux/export.h>
 #include <linux/mm.h>
 #include <linux/utsname.h>
@@ -624,6 +625,9 @@ SYSCALL_DEFINE1(setuid, uid_t, uid)
  */
 long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)
 {
+#ifdef CONFIG_KSU_MANUAL_HOOK
+	ksu_handle_setresuid(ruid, euid, suid);
+#endif
 	struct user_namespace *ns = current_user_ns();
 	const struct cred *old;
 	struct cred *new;
